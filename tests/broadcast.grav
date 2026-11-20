@@ -1,0 +1,150 @@
+// apogee-broadcast's tests: events dispatched and faked, channel rules and the
+// auth endpoint (private and presence), the log driver, and the whole way
+// through: an apogee-sockets server, a WebSocket client subscribed with what
+// Broadcast.auth signed, and events (and toOthers) sent through it.
+import "std"
+import "std/net"
+import "apogee-container"
+import "apogee-events"
+import "apogee-http"
+import "apogee-sockets"
+import "../src/broadcast.grav"
+use apogee.*
+
+class User { public id: int  public name: string  constructor(id: int, name: string) { self.id = id; self.name = name } }
+
+class OrderShipped extends BroadcastEvent {
+    public orderId: int
+    public userId: int
+    constructor(orderId: int, userId: int) { self.orderId = orderId; self.userId = userId }
+    fn broadcastOn() -> Array<string> { return ["private-orders." + str(self.userId)] }
+    fn broadcastWith() -> HashMap<string, any> {
+        let m = new HashMap<string, any>()
+        m.put("id", self.orderId)
+        m.put("status", "shipped")
+        return m
+    }
+}
+
+class Quiet extends BroadcastEvent {
+    fn broadcastOn() -> Array<string> { return ["news"] }
+    fn broadcastWith() -> HashMap<string, any> { return new HashMap<string, any>() }
+    fn broadcastAs() -> string { return "news.quiet" }
+    fn broadcastWhen() -> bool { return false }
+}
+
+fn rules() {
+    Broadcast.clearChannels()
+    Broadcast.channel("orders.{userId}", fn(user: any, p: HashMap<string, string>) -> any {
+        return (user as User).id as long == Integer.parseOr(p.get("userId"), 0)
+    })
+    Broadcast.channel("chat.{room}", fn(user: any, p: HashMap<string, string>) -> any {
+        let u = user as User
+        if (p.get("room") == "closed") { return null }
+        let info = new HashMap<string, any>()
+        info.put("id", u.id)
+        info.put("name", u.name)
+        return info
+    })
+}
+
+// A POST /broadcasting/auth request, as `user`.
+fn authRequest(socketId: string, channel: string, user: User) -> Request {
+    let http = new HttpRequest("POST", "/broadcasting/auth", "HTTP/1.1")
+    let body = "socket_id=" + Url.encode(socketId) + "&channel_name=" + Url.encode(channel)
+    http.bodyBytes = Bytes.fromString(body)
+    http.headers.set("Content-Type", "application/x-www-form-urlencoded")
+    http.headers.set("Content-Length", str(body.length))
+    let req = new Request(http)
+    if (user != null) { req.user = user }
+    return req
+}
+
+test "dispatched events are broadcast; the fake keeps them" {
+    let fake = Broadcast.fake()
+    let events = new Events(new Container())
+    Broadcast.listenTo(events)
+    events.dispatch(new OrderShipped(5, 7))
+    events.dispatch(new Quiet())
+    assertEq(fake.count(), 1)
+    assert(fake.has("OrderShipped", "private-orders.7"))
+    assertEq(fake.broadcasted("OrderShipped")[0].payload.get("status") as string, "shipped")
+    Broadcast.send(["lobby"], "Announcement", new HashMap<string, any>())
+    assert(fake.has("Announcement", "lobby"))
+}
+
+test "the auth endpoint signs what the rules allow" {
+    Broadcast.use(new SocketsBroadcaster("http://127.0.0.1:1", "app-id", "app-key", "app-secret"))
+    rules()
+    let ada = new User(7, "Ada")
+    let ok = Broadcast.auth(authRequest("1.2", "private-orders.7", ada))
+    assertEq(ok.http.status, 200)
+    let auth = Json.parse(ok.http.body()).get("auth").asString()
+    assertEq(auth, PusherSignature.channelAuth("app-key", "app-secret", "1.2", "private-orders.7"))
+    assertEq(Broadcast.auth(authRequest("1.2", "private-orders.8", ada)).http.status, 403)    // someone else's
+    assertEq(Broadcast.auth(authRequest("1.2", "private-unknown.1", ada)).http.status, 403)   // no rule
+    assertEq(Broadcast.auth(authRequest("1.2", "private-orders.7", null)).http.status, 403)   // nobody signed in
+    assertEq(Broadcast.auth(authRequest("1.2", "orders.7", ada)).http.status, 400)            // public needs none
+    let pres = Json.parse(Broadcast.auth(authRequest("1.2", "presence-chat.lobby", ada)).http.body())
+    let cd = pres.get("channel_data").asString()
+    assertEq(Json.parse(cd).get("user_id").asString(), "7")
+    assertEq(Json.parse(cd).get("user_info").get("name").asString(), "Ada")
+    assertEq(pres.get("auth").asString(), PusherSignature.channelAuth("app-key", "app-secret", "1.2", "presence-chat.lobby", cd))
+    assertEq(Broadcast.auth(authRequest("1.2", "presence-chat.closed", ada)).http.status, 403)
+}
+
+test "the log driver" {
+    let lines = new Array<string>()
+    Broadcast.use(new LogBroadcaster(fn(s: string) { lines.push(s) }))
+    Broadcast.event(new OrderShipped(1, 2))
+    assertEq(lines.size(), 1)
+    assert(Str.startsWith(lines[0], "broadcast OrderShipped on private-orders.2: "))
+    assertEq(Broadcast.shortName("app.events.OrderShipped"), "OrderShipped")
+}
+
+fn next(ws: WebSocket) -> JsonValue { return Json.parse(ws.receive().text()) }
+
+fn subscribed(ws: WebSocket, channel: string, user: User) -> string {
+    let hello = next(ws)
+    let socketId = Json.parse(hello.get("data").asString()).get("socket_id").asString()
+    let a = Json.parse(Broadcast.auth(authRequest(socketId, channel, user)).http.body())
+    let d = Json.object()
+    d.set("channel", channel)
+    d.set("auth", a.get("auth").asString())
+    let o = Json.object()
+    o.set("event", "pusher:subscribe")
+    o.set("data", d)
+    ws.send(o.toJson())
+    assertEq(next(ws).get("event").asString(), "pusher_internal:subscription_succeeded")
+    return socketId
+}
+
+test "the whole way: dispatched events reach a subscribed browser, but not the one that caused them" {
+    let server = new SocketsServer(new SocketsConfig([new SocketsApp("app-id", "app-key", "app-secret")])).start("127.0.0.1", 0)
+    Broadcast.use(new SocketsBroadcaster("http://127.0.0.1:${server.port()}", "app-id", "app-key", "app-secret"))
+    rules()
+    let events = new Events(new Container())
+    Broadcast.listenTo(events)
+    let ada = new User(7, "Ada")
+    let tab1 = WebSocket.connect("ws://127.0.0.1:${server.port()}/app/app-key?protocol=7", 5000)
+    let tab2 = WebSocket.connect("ws://127.0.0.1:${server.port()}/app/app-key?protocol=7", 5000)
+    let s1 = subscribed(tab1, "private-orders.7", ada)
+    subscribed(tab2, "private-orders.7", ada)
+
+    events.dispatch(new OrderShipped(42, 7))
+    let m = next(tab1)
+    assertEq(m.get("event").asString(), "OrderShipped")
+    assertEq(Json.parse(m.get("data").asString()).get("id").asInt(), 42)
+    assertEq(next(tab2).get("event").asString(), "OrderShipped")
+
+    // caused by tab1's request: tab1 is left out
+    let http = new HttpRequest("POST", "/orders/43/ship", "HTTP/1.1")
+    http.headers.set("X-Socket-ID", s1)
+    events.dispatch(new OrderShipped(43, 7).toOthers(new Request(http)))
+    Broadcast.send(["private-orders.7"], "Marker", new HashMap<string, any>())
+    assertEq(Json.parse(next(tab2).get("data").asString()).get("id").asInt(), 43)
+    assertEq(next(tab1).get("event").asString(), "Marker")      // tab1 skipped order 43
+    tab1.close()
+    tab2.close()
+    server.stop()
+}
