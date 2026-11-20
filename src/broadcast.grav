@@ -1,0 +1,280 @@
+// broadcast.grav — events sent to browsers as they happen: an event the app
+// dispatches is also pushed, over WebSockets, to the pages listening on its
+// channels (apogee-sockets, or another Pusher-protocol server).
+//
+//   class OrderShipped extends BroadcastEvent {
+//       public order: Order
+//       constructor(o: Order) { self.order = o }
+//       fn broadcastOn() -> Array<string> { return ["private-orders." + str(self.order.userId)] }
+//       fn broadcastWith() -> HashMap<string, any> { return {"id": self.order.id, "status": "shipped"} }
+//   }
+//
+//   Broadcast.use(new SocketsBroadcaster("http://127.0.0.1:6001", "app-id", "app-key", "app-secret"))
+//   Broadcast.listenTo(events)                       // dispatching a BroadcastEvent broadcasts it
+//   Broadcast.channel("orders.{userId}", fn(user: any, p: HashMap<string, string>) -> any {
+//       return (user as User).id == Integer.parseOr(p.get("userId"), 0)
+//   })
+//   router.post("/broadcasting/auth", fn(req: Request) -> Response { return Broadcast.auth(req) })
+//
+//   events.dispatch(new OrderShipped(order))
+//   Broadcast.event(new OrderShipped(order).toOthers(req))   // not to the tab that caused it
+import "std"
+import "std/net"
+import "apogee-container"
+import "apogee-events"
+import "apogee-http"
+
+namespace apogee {
+
+    // An event that is also sent to browsers. `broadcastOn` names its channels
+    // ("orders", "private-orders.7", "presence-chat.1"); `broadcastWith` is the
+    // data they get; `broadcastAs` the event name they listen for (the class
+    // name unless changed).
+    @Broadcastable abstract class BroadcastEvent {
+        // A connection (its socket id) not to send it to: the one whose request caused it.
+        public exceptSocket: string = ""
+        abstract fn broadcastOn() -> Array<string>
+        abstract fn broadcastWith() -> HashMap<string, any>
+        fn broadcastAs() -> string { return Broadcast.shortName(typename(self)); }
+        // Whether to send it at all (checked when it is dispatched).
+        fn broadcastWhen() -> bool { return true; }
+        // Leaves out the connection that made `req` (its X-Socket-ID header, which
+        // Laravel Echo and pusher-js setups send).
+        fn toOthers(req: Request) -> BroadcastEvent { self.exceptSocket = req.header("X-Socket-ID"); return self; }
+    }
+
+    // Sends an event to channels.
+    interface Broadcaster {
+        fn broadcast(channels: Array<string>, event: string, payload: HashMap<string, any>, exceptSocket: string)
+    }
+
+    // A Pusher-protocol server's HTTP API: apogee-sockets, or another server
+    // that speaks it. Requests are signed with the app's secret.
+    class SocketsBroadcaster implements Broadcaster {
+        public baseUrl: string
+        public appId: string
+        public key: string
+        public secret: string
+        private client: HttpClient
+        private lock: Mutex
+        constructor(baseUrl: string, appId: string, key: string, secret: string) {
+            self.baseUrl = Str.endsWith(baseUrl, "/") ? baseUrl[..baseUrl.length - 1] : baseUrl;
+            self.appId = appId;
+            self.key = key;
+            self.secret = secret;
+            self.client = new HttpClient();
+            self.client.timeoutMs = 10000;
+            self.lock = new Mutex();
+        }
+        fn broadcast(channels: Array<string>, event: string, payload: HashMap<string, any>, exceptSocket: string) {
+            // (at most 100 channels per request)
+            let at = 0;
+            while (at < channels.size()) {
+                let end = at + 100 < channels.size() ? at + 100 : channels.size();
+                let o = new HashMap<string, any>();
+                o.put("name", event);
+                let some = new Array<any>();
+                for (i in at..end) { some.push(channels[i]); }
+                o.put("channels", some);
+                o.put("data", JsonWriter.encode(payload));
+                if (exceptSocket != "") { o.put("socket_id", exceptSocket); }
+                self.post("/apps/" + self.appId + "/events", JsonWriter.encode(o));
+                at = end;
+            }
+        }
+        // A signed POST to the API; StateError when it is refused.
+        fn post(path: string, body: string) {
+            let p = new SortedMap<string, string>(fn(a: string, b: string) => Str.compare(a, b));
+            p.put("auth_key", self.key);
+            p.put("auth_timestamp", str(Time.now()));
+            p.put("auth_version", "1.0");
+            p.put("body_md5", Hash.md5(body));
+            let parts = new Array<string>();
+            for ((k, v) in p) { parts.push(k + "=" + v); }
+            let query = Str.join(parts, "&");
+            let sig = Hash.hmacSha256(self.secret, "POST\n" + path + "\n" + query);
+            self.lock.lock();
+            let res: HttpResponse = null;
+            try { res = self.client.post(self.baseUrl + path + "?" + query + "&auth_signature=" + sig, body, "application/json"); }
+            catch (e: Exception) { self.lock.unlock(); throw new StateError("broadcasting failed: " + e.message()); }
+            self.lock.unlock();
+            if (res.status != 200) { throw new StateError("broadcasting failed: HTTP ${res.status} " + res.body()); }
+        }
+    }
+
+    // Writes each event as a line (development).
+    class LogBroadcaster implements Broadcaster {
+        private write: fn(string)
+        constructor(write: fn(string)) { self.write = write; }
+        fn broadcast(channels: Array<string>, event: string, payload: HashMap<string, any>, exceptSocket: string) {
+            let w = self.write;
+            w("broadcast " + event + " on " + Str.join(channels, ", ") + ": " + JsonWriter.encode(payload));
+        }
+    }
+
+    // Sends nothing.
+    class NullBroadcaster implements Broadcaster {
+        fn broadcast(channels: Array<string>, event: string, payload: HashMap<string, any>, exceptSocket: string) {}
+    }
+
+    // One event a FakeBroadcaster was given.
+    class SentBroadcast {
+        public channels: Array<string>
+        public event: string
+        public payload: HashMap<string, any>
+        public exceptSocket: string
+        constructor(channels: Array<string>, event: string, payload: HashMap<string, any>, exceptSocket: string) {
+            self.channels = channels; self.event = event; self.payload = payload; self.exceptSocket = exceptSocket;
+        }
+    }
+
+    // Keeps what it is given, for tests to look at (Broadcast.fake()).
+    class FakeBroadcaster implements Broadcaster {
+        public sent: Array<SentBroadcast> = new Array<SentBroadcast>()
+        private lock: Mutex = new Mutex()
+        fn broadcast(channels: Array<string>, event: string, payload: HashMap<string, any>, exceptSocket: string) {
+            self.lock.lock();
+            self.sent.push(new SentBroadcast(channels.copy(), event, payload, exceptSocket));
+            self.lock.unlock();
+        }
+        // The events called `event` (on `channel`, when given).
+        fn broadcasted(event: string, channel: string = "") -> Array<SentBroadcast> {
+            return self.sent.filter(fn(s: SentBroadcast) => s.event == event && (channel == "" || s.channels.contains(channel)));
+        }
+        fn has(event: string, channel: string = "") -> bool { return self.broadcasted(event, channel).size() > 0; }
+        fn count() -> int { return self.sent.size(); }
+    }
+
+    // Who may subscribe to channels whose name matches a pattern.
+    class ChannelRule {
+        public pattern: string
+        public segments: Array<string>
+        // private channels: a bool; presence channels: the member's info (with an
+        // "id"), or null to refuse
+        public authorize: fn(any, HashMap<string, string>) -> any
+        constructor(pattern: string, authorize: fn(any, HashMap<string, string>) -> any) {
+            self.pattern = pattern;
+            self.segments = Str.split(pattern, ".");
+            self.authorize = authorize;
+        }
+        // The pattern's {params} from `name`, or null when it does not match.
+        fn match(name: string) -> HashMap<string, string> {
+            let parts = Str.split(name, ".");
+            if (parts.size() != self.segments.size()) { return null; }
+            let out = new HashMap<string, string>();
+            for (i in 0..parts.size()) {
+                let s = self.segments[i];
+                if (Str.startsWith(s, "{") && Str.endsWith(s, "}")) { out.put(s[1..s.length - 1], parts[i]); }
+                else if (s != "*" && s != parts[i]) { return null; }
+            }
+            return out;
+        }
+    }
+
+    // The app's broadcaster and channel rules, as statics.
+    class Broadcast {
+        private static broadcaster: Broadcaster = null
+        private static rules: Array<ChannelRule> = new Array<ChannelRule>()
+        private static key: string = ""
+        private static secret: string = ""
+
+        // Sends events through `b` (a SocketsBroadcaster also gives Broadcast.auth its key and secret).
+        static fn use(b: Broadcaster) {
+            Broadcast.broadcaster = b;
+            if (b is SocketsBroadcaster) {
+                let s = b as SocketsBroadcaster;
+                Broadcast.key = s.key;
+                Broadcast.secret = s.secret;
+            }
+        }
+        // The key and secret subscriptions are signed with (when the broadcaster is not a SocketsBroadcaster).
+        static fn credentials(key: string, secret: string) { Broadcast.key = key; Broadcast.secret = secret; }
+        // Puts a FakeBroadcaster in place, and returns it.
+        static fn fake() -> FakeBroadcaster {
+            let f = new FakeBroadcaster();
+            Broadcast.broadcaster = f;
+            return f;
+        }
+        static fn instance() -> Broadcaster {
+            let b = Broadcast.broadcaster;
+            if (b == null) { throw new StateError("no broadcaster: call Broadcast.use(...) first"); }
+            return b;
+        }
+
+        // Sends `e` now (when its broadcastWhen() says so).
+        static fn event(e: BroadcastEvent) {
+            if (!e.broadcastWhen()) { return; }
+            Broadcast.instance().broadcast(e.broadcastOn(), e.broadcastAs(), e.broadcastWith(), e.exceptSocket);
+        }
+        // Sends an event that is not a class.
+        static fn send(channels: Array<string>, event: string, payload: HashMap<string, any>, exceptSocket: string = "") {
+            Broadcast.instance().broadcast(channels, event, payload, exceptSocket);
+        }
+        // Every BroadcastEvent dispatched through `events` is broadcast as well.
+        static fn listenTo(events: Events) {
+            events.listen::<BroadcastEvent>(fn(e: BroadcastEvent) { Broadcast.event(e); });
+        }
+
+        // ── channels ───────────────────────────────────────────────────────────
+        // Who may subscribe to private-<pattern> and presence-<pattern> channels:
+        // `authorize(user, params)` gets the signed-in user and the pattern's
+        // {params}. For a private channel it returns a bool; for a presence channel
+        // the member's info as a HashMap<string, any> with an "id" (null refuses).
+        static fn channel(pattern: string, authorize: fn(any, HashMap<string, string>) -> any) {
+            Broadcast.rules.push(new ChannelRule(pattern, authorize));
+        }
+        // The /broadcasting/auth endpoint: `socket_id` and `channel_name` from the
+        // request, the user from req.user. 200 with {"auth"[, "channel_data"]}, 403
+        // when the rule says no (or no rule matches, or nobody is signed in).
+        static fn auth(req: Request) -> Response {
+            let socketId = str(req.input("socket_id", ""));
+            let channel = str(req.input("channel_name", ""));
+            let presence = Str.startsWith(channel, "presence-");
+            if (socketId == "" || (!presence && !Str.startsWith(channel, "private-"))) {
+                return Response.json({"message": "expected socket_id and a private- or presence- channel_name"}, 400);
+            }
+            if (Broadcast.secret == "") { throw new StateError("no secret to sign subscriptions with: Broadcast.use(SocketsBroadcaster) or Broadcast.credentials(...)"); }
+            let user = req.user;
+            if (user == null) { return Response.json({"message": "Unauthenticated."}, 403); }
+            let bare = channel[(presence ? 9 : 8)..];
+            for (rule in Broadcast.rules) {
+                let params = rule.match(bare);
+                if (params == null) { continue; }
+                let check = rule.authorize;
+                let answer = check(user, params);
+                if (!presence) {
+                    if (answer is bool && (answer as bool)) {
+                        return Response.json({"auth": Broadcast.signature(socketId, channel, "")});
+                    }
+                    return Response.json({"message": "Forbidden."}, 403);
+                }
+                if (!(answer is HashMap<string, any>)) { return Response.json({"message": "Forbidden."}, 403); }
+                let info = answer as HashMap<string, any>;
+                let member = new HashMap<string, any>();
+                member.put("user_id", str(info.getOr("id", "")));
+                member.put("user_info", info);
+                let channelData = JsonWriter.encode(member);
+                let out = new HashMap<string, any>();
+                out.put("auth", Broadcast.signature(socketId, channel, channelData));
+                out.put("channel_data", channelData);
+                return Response.json(out);
+            }
+            return Response.json({"message": "Forbidden."}, 403);
+        }
+        // "key:HMAC-SHA256(secret, socket_id:channel[:channel_data])".
+        static fn signature(socketId: string, channel: string, channelData: string) -> string {
+            let text = socketId + ":" + channel + (channelData == "" ? "" : ":" + channelData);
+            return Broadcast.key + ":" + Hash.hmacSha256(Broadcast.secret, text);
+        }
+        // Forgets the rules (tests).
+        static fn clearChannels() { Broadcast.rules.clear(); }
+
+        // "OrderShipped" from "app.events.OrderShipped" (or a C-style mangled name).
+        static fn shortName(name: string) -> string {
+            let dot = Str.lastIndexOf(name, ".");
+            let n = dot >= 0 ? name[dot + 1..] : name;
+            let us = Str.lastIndexOf(n, "__");
+            return us >= 0 ? n[us + 2..] : n;
+        }
+    }
+}
