@@ -71,7 +71,7 @@ or 403.
 
 | | |
 |---|---|
-| `SocketsBroadcaster(baseUrl, appId, key, secret)` | the Pusher HTTP API: apogee-sockets, or another server that speaks it; also gives `Broadcast.auth` its key and secret |
+| `SocketsBroadcaster(baseUrl, appId, key, secret, background = true)` | the Pusher HTTP API: apogee-sockets, or another server that speaks it; also gives `Broadcast.auth` its key and secret. Events go out from a background thread, in order, so dispatching does not wait for HTTP (failures go to its `onError`); `Broadcast.flush()` waits until they are sent (call it before a short-lived process exits). With `background` false, each is sent before `broadcast` returns. |
 | `LogBroadcaster(fn(string))` | each event as a line |
 | `NullBroadcaster` | nothing |
 | `Broadcast.fake()` | a `FakeBroadcaster` that keeps what it is sent: `has(event, channel)`, `broadcasted(event)`, `count()` |
