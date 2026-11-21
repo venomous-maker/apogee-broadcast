@@ -6,6 +6,16 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Performance
+
+- `SocketsBroadcaster` sends from a background thread by default: dispatching
+  an event waits about 4 µs instead of the HTTP request's 100 µs (in order;
+  failures go to `onError`). `flush()` and `Broadcast.flush()` wait until
+  everything queued is sent; `new SocketsBroadcaster(..., background: false)`
+  sends before returning, as before.
+- Requests from several threads no longer queue behind one HTTP client: a small
+  pool of keep-alive clients serves them.
+
 ## 0.1.0 (2026-11-20)
 
 The first release. Needs grav 1.10.0 or newer.
