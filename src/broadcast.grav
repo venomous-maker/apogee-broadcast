@@ -50,20 +50,33 @@ namespace apogee {
 
     // A Pusher-protocol server's HTTP API: apogee-sockets, or another server
     // that speaks it. Requests are signed with the app's secret.
+    //
+    // By default events go out from a background thread, in order: dispatching
+    // one does not wait for the HTTP request. A failure there is told to
+    // `onError` (stderr by default). flush() waits until everything queued is
+    // sent (call it before a short-lived process exits). With `background`
+    // false, broadcast() sends before it returns, and throws when it fails.
     class SocketsBroadcaster implements Broadcaster {
         public baseUrl: string
         public appId: string
         public key: string
         public secret: string
-        private client: HttpClient
+        public onError: fn(Exception) = fn(e: Exception) { IO.eprint("broadcasting failed: " + e.message()); }
+        private background: bool
+        private outbox: Channel<string> = null
+        private pending: AtomicInt
+        private sender: Thread = null
+        // HTTP clients ready for use (one per sending thread at a time).
+        private idle: Array<HttpClient>
         private lock: Mutex
-        constructor(baseUrl: string, appId: string, key: string, secret: string) {
+        constructor(baseUrl: string, appId: string, key: string, secret: string, background: bool = true) {
             self.baseUrl = Str.endsWith(baseUrl, "/") ? baseUrl[..baseUrl.length - 1] : baseUrl;
             self.appId = appId;
             self.key = key;
             self.secret = secret;
-            self.client = new HttpClient();
-            self.client.timeoutMs = 10000;
+            self.background = background;
+            self.pending = new AtomicInt(0);
+            self.idle = new Array<HttpClient>();
             self.lock = new Mutex();
         }
         fn broadcast(channels: Array<string>, event: string, payload: HashMap<string, any>, exceptSocket: string) {
@@ -78,10 +91,47 @@ namespace apogee {
                 o.put("channels", some);
                 o.put("data", JsonWriter.encode(payload));
                 if (exceptSocket != "") { o.put("socket_id", exceptSocket); }
-                self.post("/apps/" + self.appId + "/events", JsonWriter.encode(o));
+                let body = JsonWriter.encode(o);
+                if (self.background) { self.enqueue(body); } else { self.post("/apps/" + self.appId + "/events", body); }
                 at = end;
             }
         }
+        private fn enqueue(body: string) {
+            self.lock.lock();
+            if (self.sender == null) {
+                self.outbox = new Channel<string>(4096);
+                let box = self.outbox;
+                self.sender = Thread.spawn("broadcaster", fn() {
+                    while (true) {
+                        let next = box.receiveOr("");
+                        if (next == "") { break; }
+                        try { self.post("/apps/" + self.appId + "/events", next); }
+                        catch (e: Exception) { let tell = self.onError; tell(e); }
+                        self.pending.add(-1);
+                    }
+                });
+            }
+            self.lock.unlock();
+            self.pending.increment();
+            self.outbox.send(body);
+        }
+        // Waits (at most `timeoutMs`) until every queued event has been sent; whether it was.
+        fn flush(timeoutMs: long = 10000) -> bool {
+            let until = Time.monotonicMs() + timeoutMs;
+            while (self.pending.get() > 0) {
+                if (Time.monotonicMs() > until) { return false; }
+                Time.sleepMs(1);
+            }
+            return true;
+        }
+        private fn takeClient() -> HttpClient {
+            self.lock.lock();
+            let c = self.idle.isEmpty() ? null : self.idle.pop();
+            self.lock.unlock();
+            if (c == null) { c = new HttpClient(); c.timeoutMs = 10000; }
+            return c;
+        }
+        private fn giveBack(c: HttpClient) { self.lock.lock(); if (self.idle.size() < 16) { self.idle.push(c); } self.lock.unlock(); }
         // A signed POST to the API; StateError when it is refused.
         fn post(path: string, body: string) {
             let p = new SortedMap<string, string>(fn(a: string, b: string) => Str.compare(a, b));
@@ -93,11 +143,11 @@ namespace apogee {
             for ((k, v) in p) { parts.push(k + "=" + v); }
             let query = Str.join(parts, "&");
             let sig = Hash.hmacSha256(self.secret, "POST\n" + path + "\n" + query);
-            self.lock.lock();
+            let client = self.takeClient();
             let res: HttpResponse = null;
-            try { res = self.client.post(self.baseUrl + path + "?" + query + "&auth_signature=" + sig, body, "application/json"); }
-            catch (e: Exception) { self.lock.unlock(); throw new StateError("broadcasting failed: " + e.message()); }
-            self.lock.unlock();
+            try { res = client.post(self.baseUrl + path + "?" + query + "&auth_signature=" + sig, body, "application/json"); }
+            catch (e: Exception) { throw new StateError("broadcasting failed: " + e.message()); }
+            self.giveBack(client);
             if (res.status != 200) { throw new StateError("broadcasting failed: HTTP ${res.status} " + res.body()); }
         }
     }
@@ -205,6 +255,11 @@ namespace apogee {
         static fn event(e: BroadcastEvent) {
             if (!e.broadcastWhen()) { return; }
             Broadcast.instance().broadcast(e.broadcastOn(), e.broadcastAs(), e.broadcastWith(), e.exceptSocket);
+        }
+        // Waits until a background broadcaster has sent what it was given.
+        static fn flush(timeoutMs: long = 10000) -> bool {
+            let b = Broadcast.broadcaster;
+            return !(b is SocketsBroadcaster) || (b as SocketsBroadcaster).flush(timeoutMs);
         }
         // Sends an event that is not a class.
         static fn send(channels: Array<string>, event: string, payload: HashMap<string, any>, exceptSocket: string = "") {
