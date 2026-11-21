@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.1 (2026-11-21)
+
 ### Performance
 
 - `SocketsBroadcaster` sends from a background thread by default: dispatching
