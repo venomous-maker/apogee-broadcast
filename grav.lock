@@ -2,4 +2,4 @@
 apogee-container = { source = "github.com/venomous-maker/apogee-container", version = "v0.2.0", commit = "f027cc66880e602a500174bf3f28fe6d943f727a" }
 apogee-events = { source = "github.com/venomous-maker/apogee-events", version = "v0.2.0", commit = "cfdb002a4382617d4c4786019fa6edcef7b67a3d" }
 apogee-http = { source = "github.com/venomous-maker/apogee-http", version = "v0.2.0", commit = "16ba7122a6371e3f6b4c01f4eb63632ea5d6a061" }
-apogee-sockets = { source = "github.com/venomous-maker/apogee-sockets", version = "v0.1.0", commit = "69a544f55e75d662acef7c285b722ac66827dd9f" }
+apogee-sockets = { source = "github.com/venomous-maker/apogee-sockets", version = "v0.1.1", commit = "d7632c403584b1f43ad8787d130824ee72a06b79" }

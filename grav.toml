@@ -8,4 +8,4 @@ apogee-container = "github.com/venomous-maker/apogee-container@v0.2.0"
 apogee-events = "github.com/venomous-maker/apogee-events@v0.2.0"
 apogee-http = "github.com/venomous-maker/apogee-http@v0.2.0"
 # (the tests send events through a real server)
-apogee-sockets = "github.com/venomous-maker/apogee-sockets@v0.1.0"
+apogee-sockets = "github.com/venomous-maker/apogee-sockets@v0.1.1"
