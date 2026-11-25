@@ -11,6 +11,10 @@ Needs grav 1.12.0 or newer.
 - `BroadcastPackage`: the module connects itself to an apogee-framework app (apogee-package):
   its settings, wiring moved here from the framework.
 
+### Dependencies
+
+- Uses apogee-package 0.1.0, apogee-routing 0.3.0, apogee-http 0.3.0, apogee-sockets 0.2.0 (from their GitHub tags).
+
 ## 0.1.1 (2026-11-21)
 
 ### Performance
