@@ -37,6 +37,19 @@ const pusher = new Pusher("app-key", { wsHost: location.hostname, wsPort: 6001, 
 pusher.subscribe("private-orders.7").bind("OrderShipped", (e) => show(e.status))
 ```
 
+## In an apogee-framework app
+
+Importing the module is all it takes: `BroadcastPackage` (apogee-package) connects it when
+the app is created. The broadcaster comes from `broadcasting.default`: `null`, `log` (to the app log) or `sockets` (apogee-sockets' `sockets:serve`, or any Pusher-protocol server). Dispatching a `BroadcastEvent` broadcasts it, and private and presence channels sign in at `POST /broadcasting/auth` (in the `web` group) unless the driver is `null`.
+
+| Setting | Default |
+|---|---|
+| `broadcasting.default` | `BROADCAST_CONNECTION`, `null` |
+| `broadcasting.connections.sockets.url` | `SOCKETS_URL`, `http://127.0.0.1:6001` |
+| `broadcasting.connections.sockets.app_id`, `.key`, `.secret` | `SOCKETS_APP_ID` (`apogee`), `SOCKETS_APP_KEY` (`apogee-key`), `SOCKETS_APP_SECRET` |
+
+Your own configuration wins over these defaults.
+
 ## Events
 
 Extend `BroadcastEvent` and say:
@@ -83,6 +96,7 @@ broadcaster is not a `SocketsBroadcaster`.
 
 ```bash
 grav test tests/broadcast.grav
+grav test tests/package.grav
 ```
 
 They run an apogee-sockets server and a WebSocket client in the same process.
