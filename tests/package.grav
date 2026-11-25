@@ -1,0 +1,25 @@
+// BroadcastPackage: the driver from broadcasting.default, and /broadcasting/auth.
+import "std"
+import "apogee-container"
+import "apogee-config"
+import "apogee-package"
+import "apogee-events"
+import "apogee-http"
+import "apogee-routing"
+import "../src/all.grav"
+use apogee.*
+
+test "the package connects itself" {
+    let ps = Packages.discover()
+    assertEq(ps[0].name(), "broadcast")
+    Config.set("broadcasting.default", "log")
+    Packages.applyDefaults(ps)
+    assertEq(Config.getString("broadcasting.connections.sockets.app_id"), "apogee")
+    let c = new Container()
+    c.instance::<Events>(new Events(c))
+    let r = new Router(c)
+    c.instance::<Router>(r)
+    r.middlewareGroup("web", new Array<string>())
+    ps[0].register(new PackageContext(c, "testing", ""))
+    ps[0].boot(new PackageContext(c, "testing", ""))
+}
