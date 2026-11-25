@@ -7,7 +7,7 @@ listening on its channels, through
 server speaking the Pusher Channels protocol. Private and presence channels
 are authorized by rules in the app.
 
-```grav
+```typescript
 import "std"
 import "apogee-broadcast"
 use apogee.*
