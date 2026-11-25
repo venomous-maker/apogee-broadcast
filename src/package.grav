@@ -1,0 +1,51 @@
+// package.grav — how apogee-broadcast connects itself to an app
+// (apogee-package): broadcasting.default is null, log or sockets (the
+// sockets:serve server, or any Pusher-protocol one); dispatching a
+// BroadcastEvent broadcasts it; private and presence channels sign in at
+// /broadcasting/auth.
+import "std"
+import "apogee-container"
+import "apogee-config"
+import "apogee-package"
+import "apogee-events"
+import "apogee-http"
+import "apogee-routing"
+import "grav-logger"
+import "broadcast.grav"
+use logger.*
+
+namespace apogee {
+
+    class BroadcastPackage extends ApogeePackage {
+        constructor() {}
+        fn name() -> string { return "broadcast"; }
+        fn defaults() -> HashMap<string, any> {
+            return {"broadcasting.default": Env.get("BROADCAST_CONNECTION", "null"),
+                    "broadcasting.connections.sockets.url": Env.get("SOCKETS_URL", "http://127.0.0.1:6001"),
+                    "broadcasting.connections.sockets.app_id": Env.get("SOCKETS_APP_ID", "apogee"),
+                    "broadcasting.connections.sockets.key": Env.get("SOCKETS_APP_KEY", "apogee-key"),
+                    "broadcasting.connections.sockets.secret": Env.get("SOCKETS_APP_SECRET", "")};
+        }
+        fn register(app: PackageContext) {
+            let s = "broadcasting.connections.sockets.";
+            let driver = Config.getString("broadcasting.default", "null");
+            if (driver == "sockets") {
+                Broadcast.use(new SocketsBroadcaster(Config.getString(s + "url"), Config.getString(s + "app_id"), Config.getString(s + "key"), Config.getString(s + "secret")));
+            } else if (driver == "log") {
+                let c = app.container;
+                Broadcast.use(new LogBroadcaster(fn(line: string) { c.make::<LogChannel>().info(line); }));
+            } else {
+                Broadcast.use(new NullBroadcaster());
+            }
+            Broadcast.credentials(Config.getString(s + "key"), Config.getString(s + "secret"));
+        }
+        fn boot(app: PackageContext) {
+            Broadcast.listenTo(app.make::<Events>());
+            if (Config.getString("broadcasting.default", "null") != "null") {
+                app.make::<Router>().middleware(["web"]).group(fn(g: Router) {
+                    g.post("/broadcasting/auth", fn(req: Request) -> Response { return Broadcast.auth(req); });
+                });
+            }
+        }
+    }
+}
